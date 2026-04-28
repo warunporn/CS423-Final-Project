@@ -1,0 +1,334 @@
+const SHEET_NAME = 'Data';
+const SETTINGS_SHEET_NAME = 'Settings';
+const OPENAI_MODEL = 'gpt-5.4-nano';
+
+function setup() {
+  const ss = SpreadsheetApp.getActive();
+
+  const dataSheet = ss.getSheetByName(SHEET_NAME) || ss.insertSheet(SHEET_NAME);
+  if (dataSheet.getLastRow() === 0) {
+    dataSheet.appendRow([
+      'Alarm',
+      'Timestamp',
+      'ระยะของขยะ(cm)',
+      'สถานะขยะ',
+      'สถานะถังขยะ',
+      'สถานะระบบ',
+    ]);
+  }
+
+  const settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME) || ss.insertSheet(SETTINGS_SHEET_NAME);
+  if (settingsSheet.getLastRow() === 0) {
+    settingsSheet.appendRow(['Key', 'Value']);
+    settingsSheet.appendRow(['AlarmEnabled', 'เปิด']);
+  }
+
+  dataSheet.setFrozenRows(1);
+  settingsSheet.setFrozenRows(1);
+}
+
+function doGet(e) {
+  setup();
+  const action = (e.parameter.action || '').trim();
+
+  if (action === 'getAlarm') {
+    return jsonOutput({
+      ok: true,
+      alarmEnabled: getAlarmEnabled(),
+      alarmText: getAlarmEnabled() ? 'เปิด' : 'ปิด',
+    });
+  }
+
+  if (action === 'data') {
+    return jsonOutput({
+      ok: true,
+      latest: getLatestRecord(),
+      summary: getFullCountSummary(),
+      alarmEnabled: getAlarmEnabled(),
+      chart: getFullCountByHour(),
+    });
+  }
+
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('Smart Trash Dashboard')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  setup();
+
+  const payload = parsePayload(e);
+  const action = payload.action || '';
+
+  if (action === 'log') {
+    appendLog(payload);
+    return jsonOutput({ ok: true, message: 'logged' });
+  }
+
+  if (action === 'setAlarm') {
+    const enabled = Boolean(payload.enabled);
+    setAlarmEnabled(enabled);
+    return jsonOutput({
+      ok: true,
+      alarmEnabled: enabled,
+      alarmText: enabled ? 'เปิด' : 'ปิด',
+    });
+  }
+
+  if (action === 'analyze') {
+    try {
+      const result = analyzeWithOpenAI();
+      return jsonOutput({ ok: true, analysis: result });
+    } catch (error) {
+      return jsonOutput({ ok: false, error: error.message });
+    }
+  }
+
+  return jsonOutput({ ok: false, error: 'Unknown action' });
+}
+
+function getDashboardData() {
+  setup();
+  return {
+    ok: true,
+    latest: toClientRecord(getLatestRecord()),
+    summary: getFullCountSummary(),
+    alarmEnabled: getAlarmEnabled(),
+    chart: getFullCountByHour(),
+  };
+}
+
+function getLatestDashboardData() {
+  setup();
+  return {
+    ok: true,
+    latest: toClientRecord(getLatestRecord()),
+    alarmEnabled: getAlarmEnabled(),
+  };
+}
+
+function setAlarmFromWeb(enabled) {
+  setup();
+  setAlarmEnabled(Boolean(enabled));
+  return {
+    ok: true,
+    alarmEnabled: Boolean(enabled),
+    alarmText: Boolean(enabled) ? 'เปิด' : 'ปิด',
+  };
+}
+
+function analyzeFromWeb() {
+  setup();
+  try {
+    return {
+      ok: true,
+      analysis: analyzeWithOpenAI(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message,
+    };
+  }
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+function appendLog(payload) {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  const wasteHeight = payload.wasteHeightCm === null || payload.wasteHeightCm === undefined
+    ? '-'
+    : Number(payload.wasteHeightCm);
+
+  sheet.appendRow([
+    payload.alarm || 'ปิด',
+    new Date(),
+    Number.isFinite(wasteHeight) ? wasteHeight : '-',
+    payload.wasteStatus || '-',
+    payload.binStatus || '-',
+    payload.systemStatus || 'เปิด',
+  ]);
+}
+
+function getLatestRecord() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return {
+      alarm: '-',
+      timestamp: '-',
+      wasteHeightCm: '-',
+      wasteStatus: '-',
+      binStatus: '-',
+      systemStatus: '-',
+    };
+  }
+
+  const row = sheet.getRange(lastRow, 1, 1, 6).getValues()[0];
+  return rowToRecord(row);
+}
+
+function getFullCountSummary() {
+  const records = getRecords(500);
+  const fullCount = records.filter((record) => record.wasteStatus === 'เต็มแล้ว').length;
+  const fallenCount = records.filter((record) => record.binStatus === 'ล้ม').length;
+  const offCount = records.filter((record) => record.systemStatus === 'ปิด').length;
+
+  return {
+    total: records.length,
+    fullCount,
+    fallenCount,
+    offCount,
+  };
+}
+
+function getFullCountByHour() {
+  const records = getRecords(1000);
+  const counts = {};
+
+  records.forEach((record) => {
+    if (record.wasteStatus !== 'เต็มแล้ว' || !(record.timestampRaw instanceof Date)) return;
+    const key = Utilities.formatDate(record.timestampRaw, Session.getScriptTimeZone(), 'dd/MM HH:00');
+    counts[key] = (counts[key] || 0) + 1;
+  });
+
+  return Object.keys(counts).sort().map((label) => ({
+    label,
+    count: counts[label],
+  }));
+}
+
+function getRecords(limit) {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const startRow = Math.max(2, lastRow - limit + 1);
+  const values = sheet.getRange(startRow, 1, lastRow - startRow + 1, 6).getValues();
+  return values.map(rowToRecord);
+}
+
+function rowToRecord(row) {
+  const timestamp = row[1] instanceof Date
+    ? Utilities.formatDate(row[1], Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss')
+    : row[1] || '-';
+
+  return {
+    alarm: row[0] || '-',
+    timestamp,
+    timestampRaw: row[1],
+    wasteHeightCm: row[2] === '' ? '-' : row[2],
+    wasteStatus: row[3] || '-',
+    binStatus: row[4] || '-',
+    systemStatus: row[5] || '-',
+  };
+}
+
+function toClientRecord(record) {
+  return {
+    alarm: record.alarm,
+    timestamp: record.timestamp,
+    wasteHeightCm: record.wasteHeightCm,
+    wasteStatus: record.wasteStatus,
+    binStatus: record.binStatus,
+    systemStatus: record.systemStatus,
+  };
+}
+
+function getAlarmEnabled() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SETTINGS_SHEET_NAME);
+  const values = sheet.getDataRange().getValues();
+  const row = values.find((item) => item[0] === 'AlarmEnabled');
+  return !row || row[1] !== 'ปิด';
+}
+
+function setAlarmEnabled(enabled) {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SETTINGS_SHEET_NAME);
+  const values = sheet.getDataRange().getValues();
+  const rowIndex = values.findIndex((row) => row[0] === 'AlarmEnabled');
+
+  if (rowIndex >= 0) {
+    sheet.getRange(rowIndex + 1, 2).setValue(enabled ? 'เปิด' : 'ปิด');
+  } else {
+    sheet.appendRow(['AlarmEnabled', enabled ? 'เปิด' : 'ปิด']);
+  }
+}
+
+function analyzeWithOpenAI() {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY');
+  if (!apiKey) {
+    throw new Error('ยังไม่ได้ตั้งค่า OPENAI_API_KEY ใน Script Properties');
+  }
+
+  const latest = getLatestRecord();
+  const summary = getFullCountSummary();
+  const chart = getFullCountByHour();
+  const recent = getRecords(50).map((record) => ({
+    time: record.timestamp,
+    wasteHeightCm: record.wasteHeightCm,
+    wasteStatus: record.wasteStatus,
+    binStatus: record.binStatus,
+    systemStatus: record.systemStatus,
+    alarm: record.alarm,
+  }));
+
+  const prompt = [
+    'วิเคราะห์ข้อมูลระบบถังขยะอัจฉริยะและให้คำแนะนำภาษาไทยแบบสั้น กระชับ ใช้ได้จริง',
+    'ให้ตอบเป็นหัวข้อ: สถานการณ์ล่าสุด, ความเสี่ยง, คำแนะนำ',
+    JSON.stringify({ latest, summary, fullCountByHour: chart, recent }, null, 2),
+  ].join('\n\n');
+
+  const response = UrlFetchApp.fetch('https://api.openai.com/v1/responses', {
+    method: 'post',
+    muteHttpExceptions: true,
+    contentType: 'application/json',
+    headers: {
+      Authorization: 'Bearer ' + apiKey,
+    },
+    payload: JSON.stringify({
+      model: OPENAI_MODEL,
+      input: prompt,
+      max_output_tokens: 700,
+    }),
+  });
+
+  const status = response.getResponseCode();
+  const body = response.getContentText();
+  if (status < 200 || status >= 300) {
+    throw new Error('OpenAI API error ' + status + ': ' + body);
+  }
+
+  const data = JSON.parse(body);
+  return extractResponseText(data);
+}
+
+function extractResponseText(data) {
+  if (data.output_text) return data.output_text;
+
+  const parts = [];
+  (data.output || []).forEach((item) => {
+    (item.content || []).forEach((content) => {
+      if (content.type === 'output_text' && content.text) {
+        parts.push(content.text);
+      }
+    });
+  });
+
+  return parts.join('\n').trim() || 'ไม่มีผลการวิเคราะห์';
+}
+
+function parsePayload(e) {
+  if (e.postData && e.postData.contents) {
+    return JSON.parse(e.postData.contents);
+  }
+  return {};
+}
+
+function jsonOutput(data) {
+  return ContentService
+    .createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
